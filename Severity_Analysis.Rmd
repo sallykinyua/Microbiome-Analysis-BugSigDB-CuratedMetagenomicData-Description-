@@ -1,0 +1,185 @@
+---
+title: "SEVERITY ANALYSIS — BrooksB_2017"
+subtitle: "Gestational age (continuous) among preterm infants"
+author: "Sally Karimi Kinyua"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+<!--
+##########################################################
+## SEVERITY ANALYSIS — BrooksB_2017
+## Gestational age (continuous) among preterm infants
+## Methods: ANCOM-BC2, MAaSLin2 (+ optional DESeq2)
+## NOTE: LEfSe is NOT applicable here - it requires exactly 2 groups,
+## and gestational_age is used here as a continuous predictor.
+##########################################################
+-->
+
+> **Methods:** ANCOM-BC2, MAaSLin2 (+ optional Corncob, DESeq2)
+>
+> **Note:** LEfSe is NOT applicable here — it requires exactly 2 groups, and `gestational_age` is used here as a continuous predictor.
+
+# Setup
+
+```{r setup}
+library(curatedMetagenomicData)
+library(dplyr)
+library(ANCOMBC)
+library(Maaslin2)
+```
+
+# Download Data
+
+```{r step1-download-data}
+brooks_data <- curatedMetagenomicData(
+  "BrooksB_2017.relative_abundance",
+  dryrun = FALSE,
+  counts = TRUE   # counts scale needed for ANCOM-BC2/MAaSLin2/DESeq2
+)
+
+tse_severity_sp <- brooks_data[[1]]
+```
+
+# Restrict to Preterm Infants with Known Gestational Age
+
+```{r step2-restrict-samples}
+tse_severity_sp <- tse_severity_sp[, tse_severity_sp$study_condition == "premature_born"]
+tse_severity_sp <- tse_severity_sp[, !is.na(tse_severity_sp$gestational_age)]
+```
+
+# Check Alpha and Beta Diversity
+
+```{r alpha-beta-diversity}
+library(mia)
+library(scater)
+library(vegan)
+
+# Alpha diversity (Shannon)
+tse_severity_sp <- addAlpha(
+  tse_severity_sp,
+  assay.type = "relative_abundance",
+  index = "shannon"
+)
+
+# Continuous predictor (gestational_age) - use a scatter, not a boxplot
+plotColData(
+  tse_severity_sp,
+  y = "shannon",
+  x = "gestational_age"
+) + ggplot2::geom_smooth(method = "lm", se = TRUE)
+
+# Beta diversity (Bray-Curtis PCoA)
+tse_severity_sp <- runMDS(
+  tse_severity_sp,
+  FUN = vegan::vegdist,
+  method = "bray",
+  assay.type = "relative_abundance",
+  name = "PCoA_Bray"
+)
+
+plotReducedDim(
+  tse_severity_sp,
+  dimred = "PCoA_Bray",
+  colour_by = "gestational_age"
+)
+```
+
+# Reduce to One Sample per Subject (Earliest Visit)
+
+BrooksB_2017 has 403 samples from only 29 subjects (longitudinal).
+Keeping only the earliest sample per subject avoids pseudo-replication.
+
+```{r step3-reduce-to-one-sample-per-subject}
+meta_sev <- as.data.frame(colData(tse_severity_sp))
+meta_sev$sample_col <- colnames(tse_severity_sp)
+
+earliest_sev <- meta_sev %>%
+  group_by(subject_id) %>%
+  slice_min(days_from_first_collection, n = 1, with_ties = FALSE) %>%
+  pull(sample_col)
+
+tse_severity_sp <- tse_severity_sp[, colnames(tse_severity_sp) %in% earliest_sev]
+
+# Sanity check - expect ~29 samples, one per subject
+tse_severity_sp
+summary(tse_severity_sp$gestational_age)
+n_distinct(colData(tse_severity_sp)$subject_id)
+```
+
+# ANCOM-BC2 (Continuous Predictor)
+
+```{r method1-ancombc2}
+out_severity <- ancombc2(
+  data = tse_severity_sp,
+  assay_name = "relative_abundance",
+  fix_formula = "gestational_age"
+)
+
+res_severity_ancombc2 <- out_severity$res
+
+diff_col <- grep("^diff_gestational_age", colnames(res_severity_ancombc2), value = TRUE)
+cat("ANCOM-BC2 significant taxa:", sum(res_severity_ancombc2[[diff_col]], na.rm = TRUE), "\n")
+
+knitr::kable(res_severity_ancombc2)
+```
+
+#  MAaSLin2 (Continuous Predictor)
+
+```{r method2-maaslin2}
+maaslin_severity_input <- as.data.frame(t(assay(tse_severity_sp, "relative_abundance")))
+maaslin_severity_meta  <- as.data.frame(colData(tse_severity_sp))
+
+fit_severity_maaslin <- Maaslin2(
+  input_data      = maaslin_severity_input,
+  input_metadata  = maaslin_severity_meta,
+  output          = "maaslin_severity_output",
+  fixed_effects   = "gestational_age",
+  normalization   = "TSS",
+  min_prevalence  = 0.1
+)
+```
+
+# Additional Methods
+
+## Corncob
+
+```{r method3-corncob}
+ps_severity <- mia::convertToPhyloseq(tse_severity_sp, assay.type = "relative_abundance")
+
+library(corncob)
+
+corncob_severity <- differentialTest(
+  formula          = ~ gestational_age,
+  phi.formula      = ~ gestational_age,
+  formula_null     = ~ 1,
+  phi.formula_null = ~ gestational_age,
+  test = "Wald",
+  data = ps_severity,
+  fdr_cutoff = 0.05
+)
+
+corncob_severity$significant_taxa
+```
+
+## DESeq2
+
+```{r method3-deseq2}
+library(DESeq2)
+
+counts_severity <- round(assay(tse_severity_sp, "relative_abundance"))
+
+dds_severity <- DESeqDataSetFromMatrix(
+  countData = counts_severity + 1L,
+  colData   = as.data.frame(colData(tse_severity_sp)),
+  design    = ~ gestational_age
+)
+
+dds_severity <- DESeq(dds_severity)
+res_deseq2_severity <- results(dds_severity)
+head(res_deseq2_severity[order(res_deseq2_severity$padj), ])
+
+```

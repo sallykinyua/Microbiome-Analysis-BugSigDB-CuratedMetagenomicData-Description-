@@ -1,0 +1,206 @@
+---
+title: "DELIVERY MODE ANALYSIS — WampachL_2018"
+subtitle: "Vaginal vs. C-section, species-level differential abundance"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+<!--
+##########################################################
+## DELIVERY MODE ANALYSIS — WampachL_2018
+## Vaginal vs. C-section, species-level differential abundance
+## Methods: ANCOM-BC2, LEfSe, MAaSLin2 (+ optional corncob, DESeq2)
+##########################################################
+-->
+
+> **Methods:** ANCOM-BC2, LEfSe, MAaSLin2 (+ optional Corncob, DESeq2)
+
+# Setup
+
+```{r setup}
+library(curatedMetagenomicData)
+library(dplyr)
+library(ANCOMBC)
+library(lefser)
+library(Maaslin2)
+```
+
+# Download Data
+
+```{r step1-download-data}
+wampach_data <- curatedMetagenomicData(
+  "WampachL_2018.relative_abundance",
+  dryrun = FALSE,
+  counts = TRUE   # counts scale needed for ANCOM-BC2/MAaSLin2/corncob/DESeq2
+)
+
+tse_delivery_sp <- wampach_data[[1]]
+```
+
+# Restrict to Samples with Known Delivery Mode
+
+```{r step2-restrict-samples}
+tse_delivery_sp <- tse_delivery_sp[, !is.na(tse_delivery_sp$born_method)]
+
+tse_delivery_sp$born_method <- factor(
+  tse_delivery_sp$born_method,
+  levels = c("vaginal", "c_section")
+)
+```
+
+# Reduce to One Sample per Subject (Earliest Visit)
+
+WampachL_2018 has repeated samples per infant (visits V1/V2/V3).
+Keeping only the earliest sample per subject avoids pseudo-replication.
+
+```{r step3-reduce-to-one-sample-per-subject}
+meta_df <- as.data.frame(colData(tse_delivery_sp))
+meta_df$sample_col <- colnames(tse_delivery_sp)
+
+earliest_samples <- meta_df %>%
+  group_by(subject_id) %>%
+  slice_min(days_from_first_collection, n = 1, with_ties = FALSE) %>%
+  pull(sample_col)
+
+tse_delivery_sp <- tse_delivery_sp[, colnames(tse_delivery_sp) %in% earliest_samples]
+
+# Sanity check - expect 16 samples, 16 subjects, 7 vaginal / 9 c_section
+tse_delivery_sp
+table(tse_delivery_sp$born_method)
+n_distinct(colData(tse_delivery_sp)$subject_id)
+```
+
+# Alpha and Beta Diversity
+
+```{r alpha-beta-diversity}
+library(mia)
+library(scater)
+library(vegan)
+
+# Alpha diversity (Shannon)
+tse_delivery_sp <- addAlpha(
+  tse_delivery_sp,
+  assay.type = "relative_abundance",
+  index = "shannon"
+)
+
+plotColData(
+  tse_delivery_sp,
+  y = "shannon",
+  x = "born_method",
+  colour_by = "born_method"
+)
+
+# Beta diversity (Bray-Curtis PCoA)
+tse_delivery_sp <- runMDS(
+  tse_delivery_sp,
+  FUN = vegan::vegdist,
+  method = "bray",
+  assay.type = "relative_abundance",
+  name = "PCoA_Bray"
+)
+
+plotReducedDim(
+  tse_delivery_sp,
+  dimred = "PCoA_Bray",
+  color_by = "born_method"
+)
+```
+
+# ANCOM-BC2
+
+```{r method1-ancombc2}
+out_delivery <- ancombc2(
+  data = tse_delivery_sp,
+  assay_name = "relative_abundance",
+  fix_formula = "born_method"
+)
+
+res_delivery_ancombc2 <- out_delivery$res
+
+diff_col <- grep("^diff_born_method", colnames(res_delivery_ancombc2), value = TRUE)
+cat("ANCOM-BC2 significant taxa:", sum(res_delivery_ancombc2[[diff_col]], na.rm = TRUE), "\n")
+
+knitr::kable(res_delivery_ancombc2)
+```
+
+# LEfSe
+
+lefser needs its OWN relativeAb() (scales to sum to 1,000,000),
+not a general-purpose transform - see project notes.
+
+```{r method2-lefse}
+delivery_ra <- lefser:::relativeAb(tse_delivery_sp)
+delivery_ra$born_method <- droplevels(as.factor(delivery_ra$born_method))
+
+res_delivery_lefse <- lefser(
+  delivery_ra,
+  classCol = "born_method",
+  lda.threshold = 2,
+  trim.names = TRUE
+)
+
+lefserPlot(res_delivery_lefse)
+```
+
+#  MAaSLin2
+
+```{r method3-maaslin2}
+maaslin_delivery_input <- as.data.frame(t(assay(tse_delivery_sp, "relative_abundance")))
+maaslin_delivery_meta  <- as.data.frame(colData(tse_delivery_sp))
+
+fit_delivery_maaslin <- Maaslin2(
+  input_data      = maaslin_delivery_input,
+  input_metadata  = maaslin_delivery_meta,
+  output          = "maaslin_delivery_output",
+  fixed_effects   = "born_method",
+  normalization   = "TSS",
+  min_prevalence  = 0.1
+)
+
+#Significant results: maaslin_delivery_output/significant_results.tsv
+
+```
+
+# Method 4: Additional
+
+## Corncob
+
+```{r method4-corncob}
+ps_delivery <- mia::convertToPhyloseq(tse_delivery_sp, assay.type = "relative_abundance")
+
+library(corncob)
+
+corncob_delivery <- differentialTest(
+  formula          = ~ born_method,
+  phi.formula      = ~ born_method,
+  formula_null     = ~ 1,
+  phi.formula_null = ~ born_method,
+  test = "Wald",
+  data = ps_delivery,
+  fdr_cutoff = 0.05
+)
+
+corncob_delivery$significant_taxa
+```
+
+## DESeq2
+
+```{r method4-deseq2}
+library(DESeq2)
+
+counts_delivery <- round(assay(tse_delivery_sp, "relative_abundance"))
+
+dds_delivery <- DESeqDataSetFromMatrix(
+  countData = counts_delivery + 1L,   # pseudocount avoids all-zero rows
+  colData   = as.data.frame(colData(tse_delivery_sp)),
+  design    = ~ born_method
+)
+
+dds_delivery <- DESeq(dds_delivery)
+res_deseq2_delivery <- results(dds_delivery)
+head(res_deseq2_delivery[order(res_deseq2_delivery$padj), ])
+```
