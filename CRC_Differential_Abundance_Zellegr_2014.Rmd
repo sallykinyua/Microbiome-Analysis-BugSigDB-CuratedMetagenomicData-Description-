@@ -1,0 +1,402 @@
+---
+title: "Potential of Fecal Microbiota for Early-Stage Detection of Colorectal Cancer"
+author: "Sally Karimi Kinyua"
+output:
+  slidy_presentation: default
+  ioslides_presentation:
+    widescreen: true
+    smaller: true
+subtitle: A Differential Abundance Analysis of the ZellerG_2014 Cohort
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+
+library(curatedMetagenomicData)
+library(dplyr)
+library(scater)
+library(mia)
+library(ANCOMBC)
+library(lefser)
+
+ ##Installing packages to aid with ANCOMBC
+remotes::install_version("CVXR", version = "1.0-15", repos = "https://cran.r-project.org")
+packageVersion("CVXR")
+library(CVXR)
+"solve" %in% ls("package:CVXR")
+```
+
+## Background
+
+Colorectal cancer (CRC) develops gradually, typically progressing through
+a precursor lesion — the **adenoma** — before becoming invasive cancer.
+Several bacterial taxa have been proposed as biomarkers of this
+progression, but their consistency across disease stages is still an
+active area of research.
+
+This analysis re-examines gut microbiome composition across three stages
+of that progression, using shotgun metagenomic data from
+**Zeller *et al.*, 2014**, *"Potential of fecal microbiota for early-stage
+detection of colorectal cancer,"* published in *Molecular Systems Biology*.
+
+
+## Research question
+
+**Does gut microbial community composition differ between healthy
+controls, adenoma patients, and CRC patients — and if so, which specific
+taxa drive that difference?**
+
+Three groups are compared throughout:
+
+| Group     | Description                          | n   |
+|-----------|---------------------------------------|-----|
+| `control` | Healthy, tumour-free individuals      | 61  |
+| `adenoma` | Colorectal adenoma (precursor lesion) | 42  |
+| `CRC`     | Colorectal cancer                     | 53  |
+
+`control` is used as the **reference group** throughout, so every result
+below is framed as "adenoma vs. healthy" or "CRC vs. healthy."
+
+
+## Analytical approach
+
+Two complementary differential abundance methods are used:
+
+- **ANCOM-BC2** — a compositionally-aware method that models bias
+  directly and works on absolute count-scale data. Generally more
+  statistically powered.
+- **LEfSe** (Linear discriminant analysis Effect Size) — combines
+  non-parametric testing (Kruskal-Wallis, Wilcoxon) with linear
+  discriminant analysis to rank taxa by effect size. More conservative,
+  widely used for its interpretable effect-size ranking.
+
+Agreement between the two methods is treated as stronger evidence for a
+given taxon's association with disease status.
+
+# Data Preparation
+
+## Identifying the dataset
+
+The `curatedMetagenomicData` package hosts hundreds of public microbiome
+studies with harmonised metadata, making it possible to reproduce and
+extend published analyses like Zeller et al. (2014) directly.
+
+```{r explore-studies}
+crc_related_terms <- c("CRC", "adenoma", "carcinoma_surgery_history", "control")
+
+crc_overview <- sampleMetadata |>
+  filter(study_condition %in% crc_related_terms) |>
+  count(study_name, study_condition)
+
+crc_overview
+```
+
+`ZellerG_2014` was selected for having all three disease stages
+represented with reasonably balanced sample sizes.
+`carcinoma_surgery_history` (present only in a different study) was
+excluded throughout, as it reflects a distinct post-surgical population
+rather than a comparable disease stage.
+
+
+## Confirming the sample subset
+
+```{r single-study-meta}
+single_study_name <- "ZellerG_2014"
+
+single_meta <- sampleMetadata |>
+  filter(study_name == single_study_name,
+         study_condition %in% c("control", "adenoma", "CRC"))
+
+table(single_meta$study_condition)
+```
+
+
+## Downloading abundance data
+
+`curatedMetagenomicData()` can return data on two different scales,
+controlled by the `counts` argument. Both are needed here, since the two
+downstream methods expect different input scales:
+
+- **`counts = FALSE`** → true relative abundance (proportions, summing to
+  ~100 per sample) — used for **quality control, diversity, and LEfSe**
+- **`counts = TRUE`** → estimated read counts (scaled by sequencing
+  depth) — used for **ANCOM-BC2**, which models count-based bias directly
+
+```{r single-study-download-ra}
+single_data_ra <- curatedMetagenomicData(
+  "2021-03-31.ZellerG_2014.relative_abundance",
+  dryrun = FALSE,
+  counts = FALSE
+)
+
+single_tse_ra <- single_data_ra[[1]]
+single_tse_ra <- single_tse_ra[, single_tse_ra$study_condition %in% c("control", "adenoma", "CRC")]
+
+single_tse_ra
+```
+
+
+## Verifying the abundance scale
+
+A quick sanity check confirms the data is on the expected proportional
+scale before any analysis begins.
+
+```{r single-study-check-ra}
+colSums(assay(single_tse_ra, "relative_abundance"))[1:5]
+range(assay(single_tse_ra, "relative_abundance"))
+```
+
+Column sums close to 100 confirm true relative abundance, not raw counts.
+
+# Quality Control & Community Structure
+
+## Sequencing depth consistency
+
+Before testing for biological differences, it's important to confirm
+there's no systematic technical bias between groups — for example, one
+group being sequenced to a different depth than another.
+
+```{r single-qc}
+colData(single_tse_ra)$total_reads <- colSums(assay(single_tse_ra, "relative_abundance"))
+
+plotColData(
+  single_tse_ra,
+  y = "total_reads",
+  x = "study_condition",
+  colour_by = "study_condition"
+)
+```
+
+All three groups cluster tightly around 100%, confirming no systematic
+QC bias between them.
+
+
+## Alpha diversity: within-sample richness
+
+Shannon diversity captures how evenly and richly the microbial community
+is represented within each individual sample.
+
+```{r single-alpha}
+single_tse_ra <- addAlpha(
+  single_tse_ra,
+  assay.type = "relative_abundance",
+  index = "shannon"
+)
+
+plotColData(
+  single_tse_ra,
+  y = "shannon",
+  x = "study_condition",
+  colour_by = "study_condition"
+)
+```
+
+Diversity is broadly similar across all three groups — consistent with
+the CRC literature, where disease-associated microbiome shifts are
+usually driven by specific taxa rather than an overall loss of diversity.
+
+
+## Beta diversity: between-sample community structure
+
+Bray-Curtis dissimilarity, visualised via Principal Coordinates Analysis
+(PCoA), shows whether samples cluster by disease status based on overall
+community composition.
+
+```{r single-beta}
+single_tse_ra <- runMDS(
+  single_tse_ra,
+  FUN = vegan::vegdist,
+  method = "bray",
+  assay.type = "relative_abundance",
+  name = "PCoA_Bray"
+)
+
+plotReducedDim(
+  single_tse_ra,
+  dimred = "PCoA_Bray",
+  color_by = "study_condition"
+)
+```
+
+Substantial overlap between groups — again pointing toward taxon-specific
+signals rather than a wholesale community shift, which is exactly what
+the differential abundance methods below are designed to detect.
+
+# Differential Abundance: ANCOM-BC2
+
+## Preparing the count-scale data
+
+```{r single-study-download-counts}
+single_data <- curatedMetagenomicData(
+  "2021-03-31.ZellerG_2014.relative_abundance",
+  dryrun = FALSE,
+  counts = TRUE
+)
+
+single_tse <- single_data[[1]]
+single_tse <- single_tse[, single_tse$study_condition %in% c("control", "adenoma", "CRC")]
+
+# Set 'control' as the reference level so every comparison reads
+# naturally as "vs. healthy control"
+single_tse$study_condition <- factor(
+  single_tse$study_condition,
+  levels = c("control", "adenoma", "CRC")
+)
+
+levels(single_tse$study_condition)
+```
+
+
+## Running ANCOM-BC2
+
+```{r single-ancombc2}
+single_out <- ancombc2(
+  data = single_tse,
+  assay_name = "relative_abundance",
+  fix_formula = "study_condition"
+)
+
+colnames(single_out$res)
+```
+
+With three groups, the model produces two sets of coefficients —
+`study_conditionadenoma` and `study_conditionCRC` — each contrasted
+against the `control` reference.
+
+
+## Results: adenoma vs. control
+
+```{r single-ancombc2-adenoma}
+res_adenoma_vs_control <- single_out$res %>%
+  select(
+    taxon,
+    lfc = lfc_study_conditionadenoma,
+    se = se_study_conditionadenoma,
+    p_val = p_study_conditionadenoma,
+    q_val = q_study_conditionadenoma,
+    diff = diff_study_conditionadenoma
+  ) %>%
+  arrange(q_val)
+
+sum(res_adenoma_vs_control$diff, na.rm = TRUE)  # count of significant taxa
+head(res_adenoma_vs_control, 10)
+```
+
+**21 taxa** are significantly differentially abundant between adenoma
+patients and healthy controls.
+
+
+## Results: CRC vs. control
+
+```{r single-ancombc2-crc}
+res_crc_vs_control <- single_out$res %>%
+  select(
+    taxon,
+    lfc = lfc_study_conditionCRC,
+    se = se_study_conditionCRC,
+    p_val = p_study_conditionCRC,
+    q_val = q_study_conditionCRC,
+    diff = diff_study_conditionCRC
+  ) %>%
+  arrange(q_val)
+
+sum(res_crc_vs_control$diff, na.rm = TRUE)  # count of significant taxa
+head(res_crc_vs_control, 10)
+```
+
+**38 taxa** are significantly differentially abundant between CRC
+patients and healthy controls — nearly double the adenoma comparison,
+consistent with more extensive microbial disruption at the more advanced
+disease stage.
+
+# Differential Abundance: LEfSe
+
+## A scaling note
+
+`lefser()` internally expects abundances scaled to sum to **1,000,000**
+per sample (parts-per-million), a convention inherited from the original
+LEfSe tool. Its own `lefser:::relativeAb()` function applies this
+scaling correctly — general-purpose relative-abundance transforms (e.g.
+from `mia`, which scale to 0–1) are not equivalent here and will cause
+the LDA effect-size step to silently return no results.
+
+```{r lefse-adenoma}
+single_ra_adenoma <- lefser:::relativeAb(
+  single_tse[, single_tse$study_condition %in% c("control", "adenoma")]
+)
+single_ra_adenoma$study_condition <- droplevels(
+  as.factor(single_ra_adenoma$study_condition)
+)
+
+res_lefse_adenoma <- lefser(
+  single_ra_adenoma,
+  classCol = "study_condition",
+  lda.threshold = 3,
+  trim.names = TRUE
+)
+lefserPlot(res_lefse_adenoma)
+```
+
+
+## LEfSe: CRC vs. control
+
+```{r lefse-crc}
+single_ra_crc <- lefser:::relativeAb(
+  single_tse[, single_tse$study_condition %in% c("control", "CRC")]
+)
+single_ra_crc$study_condition <- droplevels(
+  as.factor(single_ra_crc$study_condition)
+)
+
+res_lefse_crc <- lefser(
+  single_ra_crc,
+  classCol = "study_condition",
+  lda.threshold = 3,
+  trim.names = TRUE
+)
+lefserPlot(res_lefse_crc)
+```
+
+Several taxa enriched in CRC here — including *Fusobacterium* and
+*Escherichia coli* — echo well-established findings in the CRC
+microbiome literature, and corroborate the ANCOM-BC2 results above
+using an independent statistical approach.
+
+# Summary & Interpretation
+
+## Key findings
+
+- **Community-level structure** (alpha and beta diversity) does not
+  differ dramatically across control, adenoma, and CRC — the microbiome
+  is not globally disrupted at either disease stage.
+- **Taxon-level differences are substantial**: ANCOM-BC2 identified
+  **21 significant taxa** in adenoma vs. control and **38** in
+  CRC vs. control, showing a clear escalation with disease progression.
+- **LEfSe independently corroborates** several of the same taxa,
+  including CRC-associated enrichment of *Fusobacterium* and
+  *Escherichia coli* — consistent with prior literature on CRC-microbiome
+  associations.
+- Together, these results support the idea that **specific bacterial
+  taxa, rather than overall community diversity, are the more sensitive
+  signal** for CRC and its precursor lesions.
+
+## Question
+How can we perform a multi-group LEfSe analysis to identify differentially abundant features across the three conditions simultaneously?
+
+
+## Next steps
+
+- Extend this analysis to additional CRC cohorts
+  (e.g. `YachidaS_2019`, `ThomasAM_2018a`, `FengQ_2015`) to test whether
+  these taxa replicate across independent populations
+- Adjust for study-level batch effects when pooling multiple cohorts
+- Cross-reference significant taxa against curated microbiome signature
+  databases (e.g. BugSigDB) for independent validation
+
+
+## Thank you
+
+**Sally Karimi Kinyua**
+
+`r Sys.Date()`
